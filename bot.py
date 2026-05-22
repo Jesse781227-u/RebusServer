@@ -52,7 +52,7 @@ logger = logging.getLogger("RebusServer")
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
-TOKEN = os.environ["8602527499:AAFADROr5RLTIGtAltsb12hldQNTCGFAo1I"]
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 DB_PATH = "rebus_stats.db"
 PDF_PATH = "rebus-puzzles.pdf"
 PUZZLES_DIR = Path("puzzles")
