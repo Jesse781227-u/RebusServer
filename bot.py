@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 RebusServer — Telegram bot for hosting rebus puzzle games in group chats.
+Uses pyTelegramBotAPI (telebot), which works on Python 3.11–3.13.
 
 Setup for Railway:
-  1. Set environment variable: TELEGRAM_BOT_TOKEN
-  2. Place the PDF as "rebus-puzzles.pdf" in the same directory as this file.
+  1. Set environment variable: TELEGRAM_BOT_TOKEN  (or BOT_TOKEN or TOKEN)
+  2. Place "rebus-puzzles.pdf" in the same directory as this file.
   3. Deploy — puzzle images are extracted automatically on first run.
 
 Commands:
@@ -12,33 +13,26 @@ Commands:
   /join         — Join the current lobby
   /startgame    — Start the game (host only, 2–7 players needed)
   /endgame      — End the current game (host or admin)
-  /scores       — Show current in-game scores
+  /scores       — Show in-game scores
   /leaderboard  — All-time leaderboard
   /mystats      — Your personal all-time stats
 """
 
-import asyncio
 import io
 import logging
 import os
 import random
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import fitz  # PyMuPDF
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+import telebot
+from telebot import types
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -52,8 +46,9 @@ logger = logging.getLogger("RebusServer")
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
-# ── Token: set the variable TELEGRAM_BOT_TOKEN (or BOT_TOKEN) in Railway ──────
-# Do NOT paste your token here — set it as an environment variable.
+
+# Set TELEGRAM_BOT_TOKEN (or BOT_TOKEN or TOKEN) as an environment variable
+# in Railway → your service → Variables.  Do NOT paste the token into this file.
 TOKEN = (
     os.environ.get("TELEGRAM_BOT_TOKEN")
     or os.environ.get("BOT_TOKEN")
@@ -72,19 +67,20 @@ if not TOKEN:
         "  ║  Do NOT edit this line in bot.py.                            ║\n"
         "  ╚══════════════════════════════════════════════════════════════╝\n"
     )
+
 DB_PATH = "rebus_stats.db"
 PDF_PATH = "rebus-puzzles.pdf"
 PUZZLES_DIR = Path("puzzles")
 
-PUZZLES_PER_GAME = 20   # number of puzzles drawn per game session
-ANSWER_TIMEOUT = 60     # seconds before moving to next puzzle
+PUZZLES_PER_GAME = 20   # puzzles drawn per game session
+ANSWER_TIMEOUT = 60     # seconds per puzzle before moving on
 MIN_PLAYERS = 2
 MAX_PLAYERS = 7
 
 # ──────────────────────────────────────────────────────────────────────────────
-# All 100 answers (from the answer-key pages of the PDF).
-# Each key maps to a list of accepted answers (all lower-case).
-# Matching is case-insensitive and ignores hyphens/apostrophes.
+# All 100 answers (from the PDF answer-key pages).
+# Each key → list of accepted answers, all lower-case.
+# Matching is case-insensitive; hyphens and apostrophes are treated as spaces.
 # ──────────────────────────────────────────────────────────────────────────────
 ANSWERS: Dict[int, List[str]] = {
     1:   ["forget it"],
@@ -198,13 +194,13 @@ def init_db() -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS player_stats (
-                user_id       INTEGER PRIMARY KEY,
-                display_name  TEXT    NOT NULL DEFAULT '',
-                username      TEXT    NOT NULL DEFAULT '',
-                games_played  INTEGER NOT NULL DEFAULT 0,
+                user_id        INTEGER PRIMARY KEY,
+                display_name   TEXT    NOT NULL DEFAULT '',
+                username       TEXT    NOT NULL DEFAULT '',
+                games_played   INTEGER NOT NULL DEFAULT 0,
                 puzzles_solved INTEGER NOT NULL DEFAULT 0,
-                games_won     INTEGER NOT NULL DEFAULT 0,
-                total_points  INTEGER NOT NULL DEFAULT 0
+                games_won      INTEGER NOT NULL DEFAULT 0,
+                total_points   INTEGER NOT NULL DEFAULT 0
             )
         """)
         con.commit()
@@ -225,12 +221,7 @@ def upsert_player(user_id: int, display_name: str, username: str) -> None:
         con.commit()
 
 
-def record_game_result(
-    user_id: int,
-    puzzles_solved: int,
-    won: bool,
-    points: int,
-) -> None:
+def record_game_result(user_id: int, puzzles_solved: int, won: bool, points: int) -> None:
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
             """
@@ -248,7 +239,7 @@ def record_game_result(
 
 def get_leaderboard(limit: int = 10) -> list:
     with sqlite3.connect(DB_PATH) as con:
-        rows = con.execute(
+        return con.execute(
             """
             SELECT display_name, games_played, puzzles_solved, games_won, total_points
             FROM player_stats
@@ -257,17 +248,15 @@ def get_leaderboard(limit: int = 10) -> list:
             """,
             (limit,),
         ).fetchall()
-    return rows
 
 
 def get_player_stats(user_id: int) -> Optional[tuple]:
     with sqlite3.connect(DB_PATH) as con:
-        row = con.execute(
+        return con.execute(
             "SELECT games_played, puzzles_solved, games_won, total_points "
             "FROM player_stats WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-    return row
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Puzzle image extraction
@@ -276,9 +265,9 @@ def get_player_stats(user_id: int) -> Optional[tuple]:
 def setup_puzzles() -> None:
     """
     Extract individual puzzle-cell images from the PDF (pages 1–8).
-    Each page has a 3-column × 4-row grid of puzzles.
-    Puzzles 97–100 have no image in the PDF; they are handled as text hints.
-    Skips extraction if the images are already present.
+    Each page has a 3-column × 4-row grid of puzzles (96 total).
+    Puzzles 97–100 have no image; they are handled as text hints.
+    Skips extraction if images are already present.
     """
     PUZZLES_DIR.mkdir(exist_ok=True)
     existing = sorted(PUZZLES_DIR.glob("puzzle_???.png"))
@@ -295,22 +284,16 @@ def setup_puzzles() -> None:
     logger.info("Extracting puzzle images from '%s'…", PDF_PATH)
     doc = fitz.open(PDF_PATH)
 
-    # PDF page dimensions: ~593 × 839 pts (A4-ish)
-    # Pages 0-7 (PDF pages 1-8) contain the puzzle grids.
-    # Header "Rebus Puzzles / www…" occupies ~82 pts at the top.
     HEADER_H: float = 82.0
     MARGIN_X: float = 3.0
     MARGIN_Y: float = 3.0
-    COLS = 3
-    ROWS = 4
-    RENDER_SCALE = 2.5  # render at ~180 DPI for sharp images
+    COLS, ROWS = 3, 4
+    SCALE = 2.5  # ~180 DPI
 
     puzzle_num = 0
     for page_idx in range(8):
         page = doc[page_idx]
-        pw = page.rect.width
-        ph = page.rect.height
-
+        pw, ph = page.rect.width, page.rect.height
         cell_w = (pw - 2 * MARGIN_X) / COLS
         cell_h = (ph - HEADER_H - MARGIN_Y) / ROWS
 
@@ -319,46 +302,35 @@ def setup_puzzles() -> None:
                 puzzle_num += 1
                 if puzzle_num > 96:
                     break
-
                 x0 = MARGIN_X + col * cell_w
                 y0 = HEADER_H + row * cell_h
                 rect = fitz.Rect(x0 + 1, y0 + 1, x0 + cell_w - 1, y0 + cell_h - 1)
-                mat = fitz.Matrix(RENDER_SCALE, RENDER_SCALE)
-                pix = page.get_pixmap(matrix=mat, clip=rect)
-                out_path = PUZZLES_DIR / f"puzzle_{puzzle_num:03d}.png"
-                pix.save(str(out_path))
+                pix = page.get_pixmap(matrix=fitz.Matrix(SCALE, SCALE), clip=rect)
+                pix.save(str(PUZZLES_DIR / f"puzzle_{puzzle_num:03d}.png"))
 
     logger.info("Extracted %d puzzle images into '%s/'.", puzzle_num, PUZZLES_DIR)
 
 
 def get_puzzle_image(puzzle_num: int) -> Optional[bytes]:
-    """Return image bytes for puzzle_num, or None if unavailable (97-100)."""
     path = PUZZLES_DIR / f"puzzle_{puzzle_num:03d}.png"
-    if path.exists():
-        return path.read_bytes()
-    return None
+    return path.read_bytes() if path.exists() else None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Answer checking
 # ──────────────────────────────────────────────────────────────────────────────
 
-_STRIP_RE = re.compile(r"['\-]")
-_SPACE_RE = re.compile(r"\s+")
+_STRIP = re.compile(r"['\-]")
+_SPACES = re.compile(r"\s+")
 
 
-def _normalize(text: str) -> str:
-    text = text.lower().strip()
-    text = _STRIP_RE.sub(" ", text)
-    text = _SPACE_RE.sub(" ", text).strip()
-    return text
+def _norm(text: str) -> str:
+    text = _STRIP.sub(" ", text.lower().strip())
+    return _SPACES.sub(" ", text).strip()
 
 
 def check_answer(puzzle_num: int, user_text: str) -> bool:
-    norm = _normalize(user_text)
-    for accepted in ANSWERS.get(puzzle_num, []):
-        if _normalize(accepted) == norm:
-            return True
-    return False
+    n = _norm(user_text)
+    return any(_norm(a) == n for a in ANSWERS.get(puzzle_num, []))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Game state
@@ -369,176 +341,172 @@ class GameState:
     chat_id: int
     host_id: int
     host_name: str
-    # user_id → display name
-    players: Dict[int, str] = field(default_factory=dict)
-    # user_id → score this game
-    scores: Dict[int, int] = field(default_factory=dict)
-    # "lobby" | "playing" | "finished"
-    status: str = "lobby"
-    # ordered list of puzzle numbers for this game
+    players: Dict[int, str] = field(default_factory=dict)   # user_id → name
+    scores:  Dict[int, int] = field(default_factory=dict)   # user_id → points
+    status: str = "lobby"                                    # lobby|playing|finished
     puzzle_queue: List[int] = field(default_factory=list)
-    # index into puzzle_queue
     current_puzzle_idx: int = 0
-    # puzzle numbers already solved in this game session
     solved: Set[int] = field(default_factory=set)
-    # PTB job queue handle for the current puzzle timeout
-    timeout_job: Optional[Any] = None
+    timeout_timer: Optional[threading.Timer] = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-# chat_id → GameState
 games: Dict[int, GameState] = {}
+games_lock = threading.Lock()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Bot instance
 # ──────────────────────────────────────────────────────────────────────────────
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UI helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def join_markup() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✋ Join Game", callback_data="join_game"))
+    return kb
+
 
 def medal(rank: int) -> str:
     return ("🥇", "🥈", "🥉")[rank] if rank < 3 else f"{rank + 1}."
 
 
 def scores_text(state: GameState) -> str:
-    sorted_scores = sorted(state.scores.items(), key=lambda kv: kv[1], reverse=True)
+    rows = sorted(state.scores.items(), key=lambda kv: kv[1], reverse=True)
     lines = []
-    for rank, (uid, pts) in enumerate(sorted_scores):
+    for rank, (uid, pts) in enumerate(rows):
         name = state.players.get(uid, "?")
         lines.append(f"{medal(rank)} {name} — {pts} pt{'s' if pts != 1 else ''}")
-    return "\n".join(lines) if lines else "No scores yet."
-
-
-def join_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("✋ Join Game", callback_data="join_game")]])
+    return "\n".join(lines) or "No scores yet."
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Game engine
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def send_next_puzzle(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    state = games.get(chat_id)
-    if not state or state.status != "playing":
+def _cancel_timer(state: GameState) -> None:
+    if state.timeout_timer:
+        state.timeout_timer.cancel()
+        state.timeout_timer = None
+
+
+def send_next_puzzle(chat_id: int) -> None:
+    with games_lock:
+        state = games.get(chat_id)
+    if not state:
         return
 
-    idx = state.current_puzzle_idx
-    total = len(state.puzzle_queue)
+    with state.lock:
+        if state.status != "playing":
+            return
+        idx = state.current_puzzle_idx
+        total = len(state.puzzle_queue)
 
     if idx >= total:
-        await finish_game(context, chat_id)
+        finish_game(chat_id)
         return
 
     puzzle_num = state.puzzle_queue[idx]
-    state.solved.discard(puzzle_num)
+    with state.lock:
+        state.solved.discard(puzzle_num)
 
     caption = (
         f"🧩 <b>Puzzle {idx + 1} / {total}</b>\n"
         f"First correct answer earns a point!  ⏱ {ANSWER_TIMEOUT}s"
     )
 
-    img_bytes = get_puzzle_image(puzzle_num)
-    if img_bytes:
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=io.BytesIO(img_bytes),
-            caption=caption,
-            parse_mode="HTML",
-        )
+    img = get_puzzle_image(puzzle_num)
+    if img:
+        bot.send_photo(chat_id, photo=io.BytesIO(img), caption=caption)
     else:
-        # Puzzles 97-100: no image in PDF — show a text hint instead
-        hint_map = {
-            97:  "🤔  <i>Jockey _ _ _ position</i>",
-            98:  "🤔  <i>Door _ _ Door</i>",
-            99:  "🤔  <i>Be _ _ time</i>",
-            100: "🤔  <i>_ _ _ _ _ _ _</i>  (a food, 7 letters)",
+        hints = {
+            97:  "🤔 <i>Jockey _ _ _ position</i>",
+            98:  "🤔 <i>Door _ _ Door</i>",
+            99:  "🤔 <i>Be _ _ time</i>",
+            100: "🤔 <i>_ _ _ _ _ _ _</i>  (a food, 7 letters)",
         }
-        hint = hint_map.get(puzzle_num, f"Puzzle #{puzzle_num}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"{caption}\n\n{hint}",
-            parse_mode="HTML",
+        bot.send_message(chat_id, f"{caption}\n\n{hints.get(puzzle_num, '')}")
+
+    # Schedule timeout
+    with state.lock:
+        _cancel_timer(state)
+        timer = threading.Timer(
+            ANSWER_TIMEOUT, _on_timeout, args=[chat_id, puzzle_num, idx]
         )
-
-    # Cancel any previous timeout job
-    if state.timeout_job:
-        state.timeout_job.schedule_removal()
-        state.timeout_job = None
-
-    # Schedule new timeout
-    state.timeout_job = context.job_queue.run_once(
-        _puzzle_timeout_job,
-        when=ANSWER_TIMEOUT,
-        data={"chat_id": chat_id, "puzzle_num": puzzle_num, "puzzle_idx": idx},
-        name=f"timeout_{chat_id}",
-    )
+        timer.daemon = True
+        state.timeout_timer = timer
+        timer.start()
 
 
-async def _puzzle_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    data = context.job.data
-    chat_id = data["chat_id"]
-    puzzle_num = data["puzzle_num"]
-    puzzle_idx = data["puzzle_idx"]
-
-    state = games.get(chat_id)
-    if not state or state.status != "playing":
-        return
-    if state.current_puzzle_idx != puzzle_idx:
-        return
-    if puzzle_num in state.solved:
-        return
-
-    # Nobody solved it in time
-    answer_display = " / ".join(a.title() for a in ANSWERS.get(puzzle_num, ["?"])[:2])
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"⏰ <b>Time's up!</b>  The answer was: <b>{answer_display}</b>",
-        parse_mode="HTML",
-    )
-
-    state.current_puzzle_idx += 1
-    await asyncio.sleep(2)
-    await send_next_puzzle(context, chat_id)
-
-
-async def finish_game(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    state = games.get(chat_id)
+def _on_timeout(chat_id: int, puzzle_num: int, puzzle_idx: int) -> None:
+    with games_lock:
+        state = games.get(chat_id)
     if not state:
         return
 
-    state.status = "finished"
-    if state.timeout_job:
-        state.timeout_job.schedule_removal()
-        state.timeout_job = None
+    with state.lock:
+        if state.status != "playing":
+            return
+        if state.current_puzzle_idx != puzzle_idx:
+            return
+        if puzzle_num in state.solved:
+            return
+        state.current_puzzle_idx += 1
 
-    sorted_scores = sorted(state.scores.items(), key=lambda kv: kv[1], reverse=True)
-    top_score = sorted_scores[0][1] if sorted_scores else 0
-    winners = [uid for uid, pts in sorted_scores if pts == top_score and pts > 0]
+    answer_display = " / ".join(a.title() for a in ANSWERS.get(puzzle_num, ["?"])[:2])
+    bot.send_message(
+        chat_id,
+        f"⏰ <b>Time's up!</b>  The answer was: <b>{answer_display}</b>",
+    )
+    time.sleep(2)
+    send_next_puzzle(chat_id)
+
+
+def finish_game(chat_id: int) -> None:
+    with games_lock:
+        state = games.get(chat_id)
+    if not state:
+        return
+
+    with state.lock:
+        if state.status == "finished":
+            return
+        state.status = "finished"
+        _cancel_timer(state)
+        sorted_scores = sorted(state.scores.items(), key=lambda kv: kv[1], reverse=True)
+        players = dict(state.players)
+
+    top = sorted_scores[0][1] if sorted_scores else 0
+    winners = [uid for uid, pts in sorted_scores if pts == top and pts > 0]
 
     lines = ["🏆 <b>Game Over!  Final Scores:</b>\n"]
     for rank, (uid, pts) in enumerate(sorted_scores):
-        name = state.players.get(uid, "?")
+        name = players.get(uid, "?")
         lines.append(f"{medal(rank)} <b>{name}</b> — {pts} pt{'s' if pts != 1 else ''}")
 
     if winners:
-        winner_names = " & ".join(state.players.get(uid, "?") for uid in winners)
-        lines.append(f"\n🎊 <b>{'Tie! ' if len(winners) > 1 else ''}{winner_names} wins!</b>  Congratulations!")
+        wnames = " & ".join(players.get(u, "?") for u in winners)
+        lines.append(f"\n🎊 <b>{'Tie! ' if len(winners) > 1 else ''}{wnames} wins!</b>  Congratulations!")
     else:
         lines.append("\nNo one scored — better luck next time!")
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="\n".join(lines),
-        parse_mode="HTML",
-    )
+    bot.send_message(chat_id, "\n".join(lines))
 
-    # Persist stats
     for uid, pts in sorted_scores:
         record_game_result(uid, puzzles_solved=pts, won=(uid in winners), points=pts)
 
-    del games[chat_id]
+    with games_lock:
+        games.pop(chat_id, None)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Command handlers
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_html(
+@bot.message_handler(commands=["start", "help"])
+def cmd_start(message: types.Message) -> None:
+    bot.send_message(
+        message.chat.id,
         "🧩 <b>RebusServer</b> — Rebus puzzle games for group chats!\n\n"
         "<b>How to play:</b>\n"
         "1. Use /newgame to open a lobby\n"
@@ -552,278 +520,246 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/join — Join the current lobby\n"
         "/startgame — Start the game (host only)\n"
         "/endgame — End the current game\n"
-        "/scores — Scores during a game\n"
+        "/scores — Live scores during a game\n"
         "/leaderboard — All-time top players\n"
-        "/mystats — Your personal stats"
+        "/mystats — Your personal stats",
     )
 
 
-async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    user = update.effective_user
+@bot.message_handler(commands=["newgame"])
+def cmd_newgame(message: types.Message) -> None:
+    chat_id = message.chat.id
+    user = message.from_user
 
-    if chat_id in games and games[chat_id].status != "finished":
-        await update.message.reply_text(
-            "⚠️ A game is already active!  Use /endgame to cancel it first."
+    with games_lock:
+        existing = games.get(chat_id)
+        if existing and existing.status != "finished":
+            bot.send_message(chat_id, "⚠️ A game is already active!  Use /endgame to cancel it first.")
+            return
+
+        state = GameState(
+            chat_id=chat_id,
+            host_id=user.id,
+            host_name=user.first_name,
+            players={user.id: user.first_name},
+            scores={user.id: 0},
         )
-        return
+        games[chat_id] = state
 
-    state = GameState(
-        chat_id=chat_id,
-        host_id=user.id,
-        host_name=user.first_name,
-        players={user.id: user.first_name},
-        scores={user.id: 0},
-    )
-    games[chat_id] = state
     upsert_player(user.id, user.first_name, user.username or "")
-
-    await update.message.reply_html(
+    bot.send_message(
+        chat_id,
         f"🎮 <b>{user.first_name}</b> opened a RebusServer game!\n\n"
         f"👥 Players (1/{MAX_PLAYERS}): <b>{user.first_name}</b>\n\n"
         f"Waiting for more players… (min {MIN_PLAYERS}, max {MAX_PLAYERS})\n"
-        f"Press the button below or use /join, then /startgame when ready!",
-        reply_markup=join_keyboard(),
+        f"Press the button below or type /join, then /startgame when ready!",
+        reply_markup=join_markup(),
     )
 
 
-async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    user = update.effective_user
+def _do_join(chat_id: int, user: types.User) -> str:
+    """
+    Try to add user to the lobby.
+    Returns an error string, or empty string on success.
+    """
+    with games_lock:
+        state = games.get(chat_id)
+        if not state or state.status == "finished":
+            return "No active lobby.  Use /newgame to start one."
+        if state.status != "lobby":
+            return "The game has already started!"
+        if user.id in state.players:
+            return "already_in"
+        if len(state.players) >= MAX_PLAYERS:
+            return f"Game is full ({MAX_PLAYERS} players max)!"
+        state.players[user.id] = user.first_name
+        state.scores[user.id] = 0
 
-    if chat_id not in games or games[chat_id].status == "finished":
-        await update.message.reply_text("No active lobby.  Use /newgame to start one.")
-        return
-
-    state = games[chat_id]
-
-    if state.status != "lobby":
-        await update.message.reply_text("The game has already started!")
-        return
-    if user.id in state.players:
-        await update.message.reply_text("You're already in the game! 👍")
-        return
-    if len(state.players) >= MAX_PLAYERS:
-        await update.message.reply_text(f"Game is full ({MAX_PLAYERS} players max)!")
-        return
-
-    state.players[user.id] = user.first_name
-    state.scores[user.id] = 0
     upsert_player(user.id, user.first_name, user.username or "")
+    return ""
 
+
+@bot.message_handler(commands=["join"])
+def cmd_join(message: types.Message) -> None:
+    chat_id = message.chat.id
+    user = message.from_user
+    err = _do_join(chat_id, user)
+
+    if err == "already_in":
+        bot.send_message(chat_id, "You're already in the game! 👍")
+        return
+    if err:
+        bot.send_message(chat_id, err)
+        return
+
+    with games_lock:
+        state = games[chat_id]
     count = len(state.players)
     player_list = ", ".join(state.players.values())
-    ready_line = (
+    ready = (
         f"Waiting for {MIN_PLAYERS - count} more player(s)…"
         if count < MIN_PLAYERS
         else f"Ready! Host (<b>{state.host_name}</b>) can /startgame"
     )
-
-    await update.message.reply_html(
+    bot.send_message(
+        chat_id,
         f"✅ <b>{user.first_name}</b> joined!\n\n"
-        f"👥 Players ({count}/{MAX_PLAYERS}): {player_list}\n\n"
-        f"{ready_line}",
-        reply_markup=join_keyboard(),
+        f"👥 Players ({count}/{MAX_PLAYERS}): {player_list}\n\n{ready}",
+        reply_markup=join_markup(),
     )
 
 
-async def btn_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
+@bot.callback_query_handler(func=lambda c: c.data == "join_game")
+def btn_join(call: types.CallbackQuery) -> None:
+    chat_id = call.message.chat.id
+    user = call.from_user
+    err = _do_join(chat_id, user)
 
-    chat_id = update.effective_chat.id
-    user = query.from_user
-
-    if chat_id not in games or games[chat_id].status == "finished":
-        await query.answer("No active lobby.  Use /newgame to start one.", show_alert=True)
+    if err == "already_in":
+        bot.answer_callback_query(call.id, "You're already in the game! 👍", show_alert=True)
+        return
+    if err:
+        bot.answer_callback_query(call.id, err, show_alert=True)
         return
 
-    state = games[chat_id]
+    bot.answer_callback_query(call.id, f"✅ You joined!")
 
-    if state.status != "lobby":
-        await query.answer("The game has already started!", show_alert=True)
-        return
-    if user.id in state.players:
-        await query.answer("You're already in the game! 👍", show_alert=True)
-        return
-    if len(state.players) >= MAX_PLAYERS:
-        await query.answer(f"Game is full ({MAX_PLAYERS} players max)!", show_alert=True)
-        return
-
-    state.players[user.id] = user.first_name
-    state.scores[user.id] = 0
-    upsert_player(user.id, user.first_name, user.username or "")
-
+    with games_lock:
+        state = games[chat_id]
     count = len(state.players)
     player_list = ", ".join(state.players.values())
-    ready_line = (
+    ready = (
         f"Waiting for {MIN_PLAYERS - count} more player(s)…"
         if count < MIN_PLAYERS
         else f"Ready! Host (<b>{state.host_name}</b>) can /startgame"
     )
-
     try:
-        await query.edit_message_text(
+        bot.edit_message_text(
             f"✅ <b>{user.first_name}</b> joined!\n\n"
-            f"👥 Players ({count}/{MAX_PLAYERS}): {player_list}\n\n"
-            f"{ready_line}",
+            f"👥 Players ({count}/{MAX_PLAYERS}): {player_list}\n\n{ready}",
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            reply_markup=join_markup(),
             parse_mode="HTML",
-            reply_markup=join_keyboard(),
         )
     except Exception:
-        await context.bot.send_message(
+        bot.send_message(
             chat_id,
             f"✅ <b>{user.first_name}</b> joined! ({count}/{MAX_PLAYERS} players)",
-            parse_mode="HTML",
         )
 
 
-async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    user = update.effective_user
+@bot.message_handler(commands=["startgame"])
+def cmd_startgame(message: types.Message) -> None:
+    chat_id = message.chat.id
+    user = message.from_user
 
-    if chat_id not in games:
-        await update.message.reply_text("No lobby active.  Use /newgame first.")
+    with games_lock:
+        state = games.get(chat_id)
+
+    if not state:
+        bot.send_message(chat_id, "No lobby active.  Use /newgame first.")
         return
-
-    state = games[chat_id]
-
     if state.status != "lobby":
-        await update.message.reply_text("The game is already running!")
+        bot.send_message(chat_id, "The game is already running!")
         return
     if user.id != state.host_id:
-        await update.message.reply_text("Only the game host can start the game.")
+        bot.send_message(chat_id, "Only the game host can start the game.")
         return
     if len(state.players) < MIN_PLAYERS:
-        await update.message.reply_text(
-            f"Need at least {MIN_PLAYERS} players.  Currently {len(state.players)}."
-        )
+        bot.send_message(chat_id, f"Need at least {MIN_PLAYERS} players.  Currently {len(state.players)}.")
         return
 
-    # Build puzzle queue — random sample from all 100
-    all_puzzles = list(range(1, 101))
-    random.shuffle(all_puzzles)
-    state.puzzle_queue = all_puzzles[:PUZZLES_PER_GAME]
-    state.current_puzzle_idx = 0
-    state.status = "playing"
+    pool = list(range(1, 101))
+    random.shuffle(pool)
+    with state.lock:
+        state.puzzle_queue = pool[:PUZZLES_PER_GAME]
+        state.current_puzzle_idx = 0
+        state.status = "playing"
 
-    player_list = "\n".join(f"  • {name}" for name in state.players.values())
-    await update.message.reply_html(
+    player_list = "\n".join(f"  • {n}" for n in state.players.values())
+    bot.send_message(
+        chat_id,
         f"🚀 <b>Game starting!</b>\n\n"
         f"👥 Players:\n{player_list}\n\n"
         f"📝 {PUZZLES_PER_GAME} puzzles  •  {ANSWER_TIMEOUT}s per puzzle\n"
         f"First correct answer scores a point.  Good luck!\n\n"
-        f"<i>Get ready… 3… 2… 1…</i>"
+        f"<i>Get ready… 3… 2… 1…</i>",
     )
 
-    await asyncio.sleep(3)
-    await send_next_puzzle(context, chat_id)
+    def _start():
+        time.sleep(3)
+        send_next_puzzle(chat_id)
+
+    threading.Thread(target=_start, daemon=True).start()
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    state = games.get(chat_id)
+@bot.message_handler(commands=["endgame"])
+def cmd_endgame(message: types.Message) -> None:
+    chat_id = message.chat.id
+    user = message.from_user
 
-    if not state or state.status != "playing":
+    with games_lock:
+        state = games.get(chat_id)
+
+    if not state:
+        bot.send_message(chat_id, "No game running.")
         return
-
-    user = update.effective_user
-    if user.id not in state.players:
-        return
-
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-
-    idx = state.current_puzzle_idx
-    if idx >= len(state.puzzle_queue):
-        return
-
-    puzzle_num = state.puzzle_queue[idx]
-    if puzzle_num in state.solved:
-        return
-
-    if not check_answer(puzzle_num, text):
-        return
-
-    # Correct answer!
-    state.solved.add(puzzle_num)
-    state.scores[user.id] = state.scores.get(user.id, 0) + 1
-
-    if state.timeout_job:
-        state.timeout_job.schedule_removal()
-        state.timeout_job = None
-
-    answer_display = ANSWERS[puzzle_num][0].title()
-    await update.message.reply_html(
-        f"✅ <b>{user.first_name}</b> got it!  <b>{answer_display}</b>  (+1 point) 🎉"
-    )
-
-    state.current_puzzle_idx += 1
-    await asyncio.sleep(2)
-    await send_next_puzzle(context, chat_id)
-
-
-async def cmd_scores(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    state = games.get(chat_id)
-
-    if not state or state.status == "finished":
-        await update.message.reply_text("No game is currently running.")
-        return
-
-    if state.status == "lobby":
-        player_list = ", ".join(state.players.values())
-        await update.message.reply_html(
-            f"⏳ Lobby open — players: {player_list}\n"
-            f"Waiting for /startgame"
-        )
-        return
-
-    idx = state.current_puzzle_idx
-    total = len(state.puzzle_queue)
-    await update.message.reply_html(
-        f"📊 <b>Scores — Puzzle {idx}/{total}</b>\n\n"
-        + scores_text(state)
-    )
-
-
-async def cmd_endgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    if chat_id not in games:
-        await update.message.reply_text("No game running.")
-        return
-
-    state = games[chat_id]
 
     is_admin = False
     try:
-        member = await context.bot.get_chat_member(chat_id, user.id)
+        member = bot.get_chat_member(chat_id, user.id)
         is_admin = member.status in ("administrator", "creator")
     except Exception:
         pass
 
     if user.id != state.host_id and not is_admin:
-        await update.message.reply_text("Only the host or a group admin can end the game.")
+        bot.send_message(chat_id, "Only the host or a group admin can end the game.")
         return
 
-    await update.message.reply_text("🛑 Game ended early.")
+    bot.send_message(chat_id, "🛑 Game ended early.")
 
-    if state.status == "playing":
-        await finish_game(context, chat_id)
-    else:
+    with state.lock:
+        was_playing = state.status == "playing"
         state.status = "finished"
-        if chat_id in games:
-            del games[chat_id]
+        _cancel_timer(state)
+
+    if was_playing:
+        finish_game(chat_id)
+    else:
+        with games_lock:
+            games.pop(chat_id, None)
 
 
-async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@bot.message_handler(commands=["scores"])
+def cmd_scores(message: types.Message) -> None:
+    chat_id = message.chat.id
+    with games_lock:
+        state = games.get(chat_id)
+
+    if not state or state.status == "finished":
+        bot.send_message(chat_id, "No game is currently running.")
+        return
+    if state.status == "lobby":
+        bot.send_message(
+            chat_id,
+            f"⏳ Lobby — players: {', '.join(state.players.values())}\nWaiting for /startgame",
+        )
+        return
+
+    idx = state.current_puzzle_idx
+    total = len(state.puzzle_queue)
+    bot.send_message(
+        chat_id,
+        f"📊 <b>Scores — Puzzle {idx}/{total}</b>\n\n" + scores_text(state),
+    )
+
+
+@bot.message_handler(commands=["leaderboard"])
+def cmd_leaderboard(message: types.Message) -> None:
     rows = get_leaderboard(10)
-
     if not rows:
-        await update.message.reply_text("No all-time stats yet.  Play a game first! 🎮")
+        bot.send_message(message.chat.id, "No all-time stats yet.  Play a game first! 🎮")
         return
 
     lines = ["🏆 <b>All-Time Leaderboard</b>\n"]
@@ -832,30 +768,82 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"{medal(rank)} <b>{name}</b> — "
             f"{points} pts  |  {won}W / {played}G  |  {solved} puzzles solved"
         )
+    bot.send_message(message.chat.id, "\n".join(lines))
 
-    await update.message.reply_html("\n".join(lines))
 
-
-async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+@bot.message_handler(commands=["mystats"])
+def cmd_mystats(message: types.Message) -> None:
+    user = message.from_user
     upsert_player(user.id, user.first_name, user.username or "")
     row = get_player_stats(user.id)
 
     if not row or row[0] == 0:
-        await update.message.reply_text(
-            f"No stats yet for {user.first_name}.  Join a game and start playing! 🎮"
-        )
+        bot.send_message(message.chat.id, f"No stats yet for {user.first_name}.  Join a game! 🎮")
         return
 
     played, solved, won, points = row
     win_rate = f"{won / played * 100:.0f}%" if played else "—"
-    await update.message.reply_html(
+    bot.send_message(
+        message.chat.id,
         f"📊 <b>Stats — {user.first_name}</b>\n\n"
         f"🎮 Games played:    <b>{played}</b>\n"
         f"🏆 Games won:       <b>{won}</b>  ({win_rate} win rate)\n"
         f"🧩 Puzzles solved:  <b>{solved}</b>\n"
-        f"⭐ Total points:    <b>{points}</b>"
+        f"⭐ Total points:    <b>{points}</b>",
     )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Answer handler (must be last so commands take priority)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.content_type == "text")
+def handle_message(message: types.Message) -> None:
+    chat_id = message.chat.id
+    with games_lock:
+        state = games.get(chat_id)
+
+    if not state or state.status != "playing":
+        return
+
+    user = message.from_user
+    if user.id not in state.players:
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        return
+
+    with state.lock:
+        idx = state.current_puzzle_idx
+        if idx >= len(state.puzzle_queue):
+            return
+        puzzle_num = state.puzzle_queue[idx]
+        if puzzle_num in state.solved:
+            return
+        if not check_answer(puzzle_num, text):
+            return
+
+        # ── Correct answer ──────────────────────────────────────────────────
+        state.solved.add(puzzle_num)
+        state.scores[user.id] = state.scores.get(user.id, 0) + 1
+        _cancel_timer(state)
+        state.current_puzzle_idx += 1
+        next_idx = state.current_puzzle_idx
+
+    answer_display = ANSWERS[puzzle_num][0].title()
+    bot.reply_to(
+        message,
+        f"✅ <b>{user.first_name}</b> got it!  <b>{answer_display}</b>  (+1 point) 🎉",
+    )
+
+    def _advance():
+        time.sleep(2)
+        if next_idx >= len(state.puzzle_queue):
+            finish_game(chat_id)
+        else:
+            send_next_puzzle(chat_id)
+
+    threading.Thread(target=_advance, daemon=True).start()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
@@ -864,23 +852,8 @@ async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 def main() -> None:
     init_db()
     setup_puzzles()
-
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("help",        cmd_start))
-    app.add_handler(CommandHandler("newgame",     cmd_newgame))
-    app.add_handler(CommandHandler("join",        cmd_join))
-    app.add_handler(CommandHandler("startgame",   cmd_startgame))
-    app.add_handler(CommandHandler("endgame",     cmd_endgame))
-    app.add_handler(CommandHandler("scores",      cmd_scores))
-    app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
-    app.add_handler(CommandHandler("mystats",     cmd_mystats))
-    app.add_handler(CallbackQueryHandler(btn_join, pattern="^join_game$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     logger.info("RebusServer is running…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
 
 
 if __name__ == "__main__":
